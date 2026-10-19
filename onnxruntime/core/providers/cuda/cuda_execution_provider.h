@@ -14,6 +14,7 @@
 #include "core/providers/cuda/cuda_execution_provider_info.h"
 #include "core/providers/cuda/cuda_graph.h"
 #include "core/providers/cuda/cuda_pch.h"
+#include "core/providers/cuda/qmoe_session_controller.h"
 #include "core/providers/cuda/shared_inc/cuda_utils.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/tunable/cuda_tuning_context.h"
@@ -34,6 +35,8 @@ class CUDAExecutionProvider : public IExecutionProvider {
   Status OnRunStart(const onnxruntime::RunOptions& run_options) override;
 
   Status OnRunEnd(bool sync_stream, const onnxruntime::RunOptions& run_options) override;
+
+  Status OnSessionInitializationEnd() override;
 
   DataLayout GetPreferredLayout() const override;
 
@@ -136,9 +139,14 @@ class CUDAExecutionProvider : public IExecutionProvider {
   void SetSessionModelPath(std::filesystem::path path) const;
   std::filesystem::path GetSessionModelPath() const;
 
+  const std::shared_ptr<onnxruntime::cuda::QMoESessionController>& GetQMoESessionController() const {
+    return qmoe_controller_;
+  }
+
  private:
   mutable std::mutex captured_host_buffers_mutex_;
   mutable std::vector<std::shared_ptr<void>> captured_host_buffers_;
+  std::shared_ptr<onnxruntime::cuda::QMoESessionController> qmoe_controller_;
 
   mutable std::mutex model_path_mutex_;
   mutable std::filesystem::path model_path_;

@@ -7,9 +7,11 @@
 #include "cuda_plugin_kernels.h"
 #include "contrib_ops/cuda/quantization/matmul_nbits_tactic_cache.h"
 #include "core/common/string_utils.h"
+#include "core/providers/cuda/cuda_allocator.h"
 #include "core/session/onnxruntime_c_api.h"
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -667,6 +669,17 @@ OrtStatus* ORT_API_CALL CudaEpFactory::CreateEpImpl(
   const std::string gpu_external_alloc_key = ep_options_prefix + "gpu_external_alloc";
   const std::string gpu_external_free_key = ep_options_prefix + "gpu_external_free";
   const std::string gpu_external_empty_cache_key = ep_options_prefix + "gpu_external_empty_cache";
+  const auto device_mem_limit = try_get_session_config(ep_options_prefix + "gpu_device_mem_limit");
+  size_t device_limit_bytes = 0;
+  if (device_mem_limit) {
+    const auto parsed = std::from_chars(device_mem_limit->data(),
+                                        device_mem_limit->data() + device_mem_limit->size(),
+                                        device_limit_bytes);
+    if (parsed.ec != std::errc{} || parsed.ptr != device_mem_limit->data() + device_mem_limit->size()) {
+      return factory->ort_api_.CreateStatus(ORT_INVALID_ARGUMENT,
+                                            "gpu_device_mem_limit must be a nonnegative byte count");
+    }
+  }
 
   // Prefer canonical EP-scoped keys, then fall back to historical flat session config names.
   read_session_config_bool(
@@ -801,6 +814,13 @@ OrtStatus* ORT_API_CALL CudaEpFactory::CreateEpImpl(
   }
 
   const OrtLogger& ep_logger = logger ? *logger : factory->default_logger_;
+  const auto budget = GetCudaDeviceMemoryBudget(static_cast<OrtDevice::DeviceId>(config.device_id));
+  budget->Configure(device_limit_bytes);
+  if (budget->GetStats().limit != std::numeric_limits<size_t>::max() &&
+      (config.external_alloc != nullptr || config.external_free != nullptr)) {
+    return factory->ort_api_.CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "gpu_device_mem_limit does not support external CUDA allocators");
+  }
   auto actual_ep = std::make_unique<CudaEp>(*factory, config, ep_logger);
   *ep = actual_ep.release();
 
@@ -856,6 +876,13 @@ OrtStatus* ORT_API_CALL CudaEpFactory::CreateAllocatorImpl(
       use_mempool = (v != nullptr && std::string(v) == "1");
     }
 
+    if (use_mempool &&
+        GetCudaDeviceMemoryBudget(static_cast<OrtDevice::DeviceId>(req_device_id))->GetStats().limit !=
+            std::numeric_limits<size_t>::max()) {
+      return factory.ort_api_.CreateStatus(ORT_INVALID_ARGUMENT,
+                                           "gpu_device_mem_limit does not support CUDA memory pools");
+    }
+
     std::lock_guard<std::mutex> lock{entry->arena_mutex};
 
     if (use_mempool) {
@@ -884,7 +911,7 @@ OrtStatus* ORT_API_CALL CudaEpFactory::CreateAllocatorImpl(
     }
 
     AllocatorUniquePtr raw_allocator(
-        new CudaDeviceAllocator(memory_info, req_device_id),
+        new CudaDeviceAllocator(memory_info, req_device_id, factory.ort_api_),
         [](OrtAllocator* p) { delete static_cast<CudaDeviceAllocator*>(p); });
     std::unique_ptr<CudaArenaAllocator> arena;
     status = CudaArenaAllocator::Create(CudaAllocatorKind::kDevice, memory_info,
@@ -1156,6 +1183,35 @@ void CudaEpFactory::AbandonDeviceArena(int device_id) noexcept {
   ORT_CATCH(...) {
     // Last-resort path from a noexcept release callback. There is no safe way to
     // free an arena whose stream completion and chunk detachment are both unknown.
+  }
+}
+
+}  // namespace cuda_plugin
+
+namespace contrib::cuda {
+void OnQMoEDeviceArenasShrunk(int device_id);
+}  // namespace contrib::cuda
+
+namespace cuda_plugin {
+
+void CudaEpFactory::ShrinkEligibleDeviceArenas(int device_id) noexcept {
+  ORT_TRY {
+    DeviceCacheEntry* entry = FindDeviceCacheEntryByOrdinal(device_id);
+    if (!entry) return;
+    {
+      std::lock_guard<std::mutex> arena_lock{entry->arena_mutex};
+      for (auto& arena : entry->device_arenas) {
+        if (!arena.abandoned && !arena.has_quarantine && arena.allocator && arena.allocator->IsShrinkEnabled()) {
+          OrtStatus* st = arena.allocator->Shrink(arena.allocator.get());
+          if (st != nullptr) {
+            ort_api_.ReleaseStatus(st);
+          }
+        }
+      }
+    }
+    ::onnxruntime::contrib::cuda::OnQMoEDeviceArenasShrunk(device_id);
+  }
+  ORT_CATCH(...) {
   }
 }
 

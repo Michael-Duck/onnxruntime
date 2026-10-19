@@ -84,6 +84,9 @@ class CudaEp : public onnxruntime::ep::adapter::Ep {
       OrtEp* this_ptr, bool* is_supported) noexcept;
 
   // CUDA Graph callback implementations
+  static OrtStatus* ORT_API_CALL OnSessionInitializationEndImpl(
+      OrtEp* this_ptr) noexcept;
+
   static OrtStatus* ORT_API_CALL OnRunStartImpl(
       OrtEp* this_ptr, const OrtRunOptions* run_options) noexcept;
 

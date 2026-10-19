@@ -25,6 +25,7 @@
 #include "core/framework/utils.h"
 #include "core/framework/max_shape_override.h"
 #include "core/framework/max_shape_inference.h"
+#include "core/framework/moe_offload_plan.h"
 #include "core/framework/node_shape_resolver.h"
 #include "core/providers/cpu/controlflow/utils.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
@@ -1699,8 +1700,75 @@ Status SessionState::FinalizeSessionState(const std::basic_string<PATH_CHAR_TYPE
     ORT_RETURN_IF_ERROR(moe_expert_state_->FinalizeInitialization());
   }
 #endif
+  for (auto& ep : execution_providers_) {
+    ORT_RETURN_IF_ERROR(ep->OnSessionInitializationEnd());
+  }
   return status;
 }
+
+namespace {
+
+bool IsMoeOffloadExpertInputIndex(std::string_view op_type, size_t input_idx) noexcept {
+  if (op_type == "MoE") {
+    return input_idx >= 2 && input_idx <= 7;
+  }
+  if (op_type == "QMoE") {
+    return (input_idx >= 2 && input_idx <= 13) || input_idx == 15 || input_idx == 16;
+  }
+  return false;
+}
+
+Status PlaceMoeOffloadInitializersOnCpu(const GraphViewer& graph_viewer,
+                                        const OrtValueNameIdxMap& ort_value_name_idx_map,
+                                        const OrtMemoryInfo& cpu_mem_info,
+                                        SequentialExecutionPlan& exec_plan,
+                                        const logging::Logger& logger) {
+  const auto& initialized_tensors = graph_viewer.GetAllInitializedTensors();
+  if (initialized_tensors.empty()) {
+    return Status::OK();
+  }
+
+  InlinedHashMap<std::string_view, bool> eligible_initializers;
+  for (const auto& node : graph_viewer.Nodes()) {
+    const bool is_moe_node = (node.Domain() == kMSDomain) &&
+                             (node.OpType() == "QMoE" || node.OpType() == "MoE") &&
+                             (node.GetExecutionProviderType() == kCudaExecutionProvider);
+    const auto& input_defs = node.InputDefs();
+    for (size_t i = 0; i < input_defs.size(); ++i) {
+      const NodeArg* arg = input_defs[i];
+      if (arg == nullptr || !arg->Exists() || arg->Name().empty()) {
+        continue;
+      }
+      if (initialized_tensors.find(arg->Name()) == initialized_tensors.end()) {
+        continue;
+      }
+      const bool is_expert_slot = is_moe_node && IsMoeOffloadExpertInputIndex(node.OpType(), i);
+      auto [it, inserted] = eligible_initializers.try_emplace(arg->Name(), is_expert_slot);
+      if (!inserted && !is_expert_slot) {
+        it->second = false;
+      }
+    }
+  }
+
+  size_t placed_on_cpu_count = 0;
+  for (const auto& [name, is_eligible] : eligible_initializers) {
+    if (!is_eligible) {
+      continue;
+    }
+    int ort_value_idx = -1;
+    ORT_RETURN_IF_ERROR(ort_value_name_idx_map.GetIdx(std::string(name), ort_value_idx));
+    exec_plan.SetLocation(static_cast<size_t>(ort_value_idx), cpu_mem_info.device);
+    ++placed_on_cpu_count;
+  }
+
+  if (placed_on_cpu_count > 0) {
+    LOGS(logger, INFO) << "PlaceMoeOffloadInitializersOnCpu placed " << placed_on_cpu_count
+                       << " MoE/QMoE expert initializer tensor(s) on CPU prior to SaveInitializedTensors.";
+  }
+  return Status::OK();
+}
+
+}  // namespace
 
 bool SessionState::GetSaveModeForPrepacks(bool saving_model, bool saving_ort_format) {
   bool save_prepacked_constant_initializers =
@@ -1974,6 +2042,16 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
   if (session_options.IsLoadCancellationFlagSet()) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, MODEL_LOAD_CANCELED,
                            "SessionState finalize is canceled due to user request");
+  }
+
+  moe_offload::MoeOffloadSessionPolicy moe_offload_policy;
+  ORT_RETURN_IF_ERROR(moe_offload::MoeOffloadSessionPolicy::ParseFromConfigOptions(
+      session_options.config_options, std::filesystem::path(graph_location), moe_offload_policy));
+  if (moe_offload_policy.mode != moe_offload::OffloadMode::kDisabled) {
+    auto cpu_alloc = GetAllocator(OrtDevice());
+    ORT_ENFORCE(cpu_alloc != nullptr, "Default CPU allocator is required for MoE offload initializer placement.");
+    ORT_RETURN_IF_ERROR(PlaceMoeOffloadInitializersOnCpu(
+        *graph_viewer_, ort_value_name_idx_map_, cpu_alloc->Info(), *p_seq_exec_plan_, logger_));
   }
 
   // Record the allocation plan
